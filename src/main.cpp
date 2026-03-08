@@ -12,6 +12,10 @@ int main() {
     book.addOrder(o2);
 
     std::cout << "Orders inserted successfully\n";
+    
+    book.cancelOrder(1);
+
+    std::cout<< "Order Cancelled Successfully\n";
 
     return 0;
 }
