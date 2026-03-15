@@ -9,6 +9,14 @@ class OrderBook {
 public:
     void addOrder(const Order& order);
     void cancelOrder(int order_id);
+    int bestBid() const;
+    int bestAsk() const;
+    
+
+    //matching engine
+
+    void matchBuyOrder(Order &order);
+    void matchSellOrder(Order &order);
 
 private:
 
