@@ -18,6 +18,12 @@ public:
     void matchBuyOrder(Order &order);
     void matchSellOrder(Order &order);
 
+    // wrapping trade
+    void executeTrade(int price, int qty, int buyOrderId, int sellOrderId);
+
+    //printing current state
+    void printOrderBook() const;
+
 private:
 
     // highest price first

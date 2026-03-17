@@ -1,20 +1,15 @@
 #include "order_book.hpp"
+#include<iostream>
 
-void OrderBook::addOrder(const Order& order)
-{
+void OrderBook::addOrder(const Order& order){
     Order newOrder = order;
-
-    if(newOrder.side == Side::BUY)
-    {
+    if(newOrder.side == Side::BUY){
         matchBuyOrder(newOrder);
-    }
-    else
-    {
+    }else{
         matchSellOrder(newOrder);
     }
 
-    if(newOrder.quantity > 0)
-    {
+    if(newOrder.quantity > 0){
         if(newOrder.side == Side::BUY)
         {
             bids[newOrder.price].push_back(newOrder);
@@ -138,7 +133,7 @@ void OrderBook::matchSellOrder(Order &order)
         auto &restingOrder = level.front();
 
         int tradeQty = std::min(order.quantity, restingOrder.quantity);
-
+        executeTrade(bestBid, tradeQty, restingOrder.order_id, order.order_id); // if trade happens prints it
         order.quantity -= tradeQty;
         restingOrder.quantity -= tradeQty;
 
@@ -149,4 +144,35 @@ void OrderBook::matchSellOrder(Order &order)
             bids.erase(bids.begin());
         }
     }
+}
+
+void OrderBook::executeTrade(int price, int qty, int buyOrderId, int sellOrderId){
+    std::cout
+        << "TRADE "
+        << "price=" << price
+        << " qty=" << qty
+        << " buy=" << buyOrderId
+        << " sell=" << sellOrderId
+        << std::endl;
+}
+
+void OrderBook::printOrderBook() const{
+    std::cout<<"------------ORDER BOOK------------\n";
+    std::cout<<"ASKS\n";
+    for(const auto &[price, level]:asks){
+        std::cout<<price<<" : ";
+        for(const auto & order:level){
+            std::cout<<"[id="<<order.order_id<<" qty="<<order.quantity<<"] ";
+        }
+        std::cout<<"\n";
+    }
+    std::cout<<"BIDS\n";
+    for(const auto & [price, level]:bids){
+        std::cout<<price<<" : ";
+        for(const auto & order:level){
+            std::cout<<"[id="<<order.order_id<<" qty="<<order.quantity<<"] ";
+        }
+        std::cout<<"\n";
+    }
+    std::cout << "------------------------\n";
 }
