@@ -176,3 +176,42 @@ void OrderBook::printOrderBook() const{
     }
     std::cout << "------------------------\n";
 }
+
+void OrderBook::processOrdersFromFile(const std::string& filename)
+{
+    std::ifstream file(filename);
+    std::string type;
+
+    int next_id = 1;
+    int timestamp = 1;
+
+    while(file >> type)
+    {
+        if(type == "BUY")
+        {
+            int price, qty;
+            file >> price >> qty;
+
+            Order o(next_id++, Side::BUY, price, qty, timestamp++);
+            addOrder(o);
+        }
+        else if(type == "SELL")
+        {
+            int price, qty;
+            file >> price >> qty;
+
+            Order o(next_id++, Side::SELL, price, qty, timestamp++);
+            addOrder(o);
+        }
+        else if(type == "CANCEL")
+        {
+            int id;
+            file >> id;
+
+            cancelOrder(id);
+        }
+
+        // debug (keep for now)
+        // printOrderBook();
+    }
+}

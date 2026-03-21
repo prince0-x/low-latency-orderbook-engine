@@ -2,6 +2,8 @@
 #include <map>
 #include <deque>
 #include <unordered_map>
+#include<string>
+#include <fstream>
 #include "order.hpp"
 
 class OrderBook {
@@ -23,6 +25,9 @@ public:
 
     //printing current state
     void printOrderBook() const;
+
+    //reading directly from file
+    void processOrdersFromFile(const std::string& filename);
 
 private:
 
