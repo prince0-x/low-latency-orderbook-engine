@@ -12,13 +12,15 @@ void OrderBook::addOrder(const Order& order){
     if(newOrder.quantity > 0){
         if(newOrder.side == Side::BUY)
         {
-            bids[newOrder.price].push_back(newOrder);
-            order_lookup[newOrder.order_id] = &bids[newOrder.price].back();
+            auto &level = bids[newOrder.price];
+            level.push_back(newOrder);
+            order_lookup[newOrder.order_id] = std::prev(level.end());
         }
         else
         {
-            asks[newOrder.price].push_back(newOrder);
-            order_lookup[newOrder.order_id] = &asks[newOrder.price].back();
+            auto &level = asks[newOrder.price];
+            level.push_back(newOrder);
+            order_lookup[newOrder.order_id] = std::prev(level.end());
         }
     }
 }
@@ -26,51 +28,67 @@ void OrderBook::addOrder(const Order& order){
 void OrderBook::cancelOrder(int order_id)
 {
     auto it = order_lookup.find(order_id);
-    if(it == order_lookup.end()){
-      return;
-    }
-    Order* order = it->second;
-    int price = order->price;
+    if(it == order_lookup.end()) return;
 
-    if(order->side == Side::BUY)
+    auto order_it = it->second;
+
+    // CRITICAL GUARD
+    if (order_it == std::deque<Order>::iterator{}) {
+        order_lookup.erase(it);
+        return;
+    }
+
+    int price = order_it->price;
+    Side side = order_it->side;
+
+    if(side == Side::BUY)
     {
         auto levelIt = bids.find(price);
-        if(levelIt == bids.end()){
-            return;
-        }
-        auto &level = levelIt->second;
-        for(auto itr = level.begin(); itr != level.end(); ++itr)
-        {
-            if(itr->order_id == order_id)
-            {
-                level.erase(itr);
-                break;
-            }
-        }
+        if(levelIt != bids.end()){
+            auto &level = levelIt->second;
 
-        if(level.empty()){
-            bids.erase(levelIt);
+            // VERIFY iterator still belongs
+            bool found = false;
+            for(auto itr = level.begin(); itr != level.end(); ++itr){
+                if(itr == order_it){
+                    level.erase(itr);
+                    found = true;
+                    break;
+                }
+            }
+
+            if(!found){
+                order_lookup.erase(it);
+                return;
+            }
+
+            if(level.empty()) bids.erase(levelIt);
         }
     }
-    else{
+    else
+    {
         auto levelIt = asks.find(price);
-        if(levelIt == asks.end()){
-            return;
-        }
-        auto &level = levelIt->second;
-        for(auto itr = level.begin(); itr != level.end(); ++itr)
-        {
-            if(itr->order_id == order_id)
-            {
-                level.erase(itr);
-                break;
-            }
-        }
+        if(levelIt != asks.end()){
+            auto &level = levelIt->second;
 
-        if(level.empty()){
-            asks.erase(levelIt);
+            bool found = false;
+            for(auto itr = level.begin(); itr != level.end(); ++itr){
+                if(itr == order_it){
+                    level.erase(itr);
+                    found = true;
+                    break;
+                }
+            }
+
+            if(!found){
+                order_lookup.erase(it);
+                return;
+            }
+
+            if(level.empty()) asks.erase(levelIt);
         }
     }
+
     order_lookup.erase(it);
 }
 
@@ -97,26 +115,33 @@ int OrderBook::bestAsk() const
 void OrderBook::matchBuyOrder(Order &order)
 {
     while(order.quantity > 0){
-        if(asks.empty()){
-            break;
-        }
+        if(asks.empty()) break;
 
-        int bestAsk = asks.begin()->first;
-        if(bestAsk > order.price){
-            break;
-        }
-        auto &level = asks.begin()->second;
+        auto it = asks.begin();
+        int bestAsk = it->first;
+
+        if(bestAsk > order.price) break;
+
+        auto &level = it->second;
         auto &restingOrder = level.front();
 
-        int tradeQty = std::min(order.quantity,restingOrder.quantity);
+        if (restingOrder.quantity == 0) {
+            order_lookup.erase(restingOrder.order_id);
+            level.pop_front();
+            continue;
+        }
+
+        int tradeQty = std::min(order.quantity, restingOrder.quantity);
         order.quantity -= tradeQty;
         restingOrder.quantity -= tradeQty;
 
         if(restingOrder.quantity == 0){
+            order_lookup.erase(restingOrder.order_id);
             level.pop_front();
         }
+
         if(level.empty()){
-            asks.erase(bestAsk);
+            asks.erase(it);
         }
     }
 }
@@ -124,24 +149,31 @@ void OrderBook::matchBuyOrder(Order &order)
 void OrderBook::matchSellOrder(Order &order)
 {
     while(order.quantity > 0 && !bids.empty()){
-        int bestBid = bids.begin()->first;
-        if(bestBid < order.price){
-            break;
-        }
+        auto it = bids.begin();
+        int bestBid = it->first;
 
-        auto &level = bids.begin()->second;
+        if(bestBid < order.price) break;
+
+        auto &level = it->second;
         auto &restingOrder = level.front();
 
+        if (restingOrder.quantity == 0) {
+            order_lookup.erase(restingOrder.order_id);
+            level.pop_front();
+            continue;
+        }
+
         int tradeQty = std::min(order.quantity, restingOrder.quantity);
-        executeTrade(bestBid, tradeQty, restingOrder.order_id, order.order_id); // if trade happens prints it
         order.quantity -= tradeQty;
         restingOrder.quantity -= tradeQty;
 
         if(restingOrder.quantity == 0){
+            order_lookup.erase(restingOrder.order_id);
             level.pop_front();
         }
+
         if(level.empty()){
-            bids.erase(bids.begin());
+            bids.erase(it);
         }
     }
 }

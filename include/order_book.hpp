@@ -37,5 +37,5 @@ private:
     // lowest price first
     std::map<int, std::deque<Order>> asks;
 
-    std::unordered_map<int, Order*> order_lookup;
+    std::unordered_map<int, std::deque<Order>::iterator> order_lookup;
 };
