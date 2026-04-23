@@ -1,249 +1,220 @@
-#include "order_book.hpp"
-#include<iostream>
+#include "engine/order_book.hpp"
+#include <algorithm>
+#include <fstream>
+#include <iostream>
+#include <string>
 
-void OrderBook::addOrder(const Order& order){
-    Order newOrder = order;
-    if(newOrder.side == Side::BUY){
-        matchBuyOrder(newOrder);
-    }else{
-        matchSellOrder(newOrder);
+// ─────────────────────────────────────────────────────────────────────────────
+// Construction — one-time heap allocation; zero malloc traffic afterwards
+// ─────────────────────────────────────────────────────────────────────────────
+
+OrderBook::OrderBook()
+    : bids_        (std::make_unique<PriceLevel[]>(MAX_PRICE))
+    , asks_        (std::make_unique<PriceLevel[]>(MAX_PRICE))
+    , bid_active_  (std::make_unique<uint64_t[]>(BITSET_WORDS))  // zero-init
+    , ask_active_  (std::make_unique<uint64_t[]>(BITSET_WORDS))  // zero-init
+    , order_lookup_(std::make_unique<OrderRef[]>(MAX_ORDERS))
+    , pool_        (std::make_unique<PoolAllocator<OrderNode, MAX_ORDERS>>())
+    , best_bid_(-1)
+    , best_ask_(MAX_PRICE)
+{}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// addOrder
+// ─────────────────────────────────────────────────────────────────────────────
+
+HOT_FN void OrderBook::addOrder(const Order& order) {
+    Order o = order;
+
+    if (o.side == Side::BUY) {
+        matchBuyOrder(o);
+    } else {
+        matchSellOrder(o);
     }
 
-    if(newOrder.quantity > 0){
-        if(newOrder.side == Side::BUY)
-        {
-            auto &level = bids[newOrder.price];
-            level.push_back(newOrder);
-            order_lookup[newOrder.order_id] = std::prev(level.end());
-        }
-        else
-        {
-            auto &level = asks[newOrder.price];
-            level.push_back(newOrder);
-            order_lookup[newOrder.order_id] = std::prev(level.end());
-        }
+    if (o.quantity <= 0) [[likely]] return;   // fully matched — common for heavy matching datasets
+
+    OrderNode* node = pool_alloc();
+    node->init(o.order_id, o.price, o.quantity, o.side);
+
+    if (o.side == Side::BUY) {
+        bids_[o.price].push_back(node);
+        set_bid_active(o.price);
+        if (o.price > best_bid_) best_bid_ = o.price;
+        order_lookup_[o.order_id] = {node, o.price, false};
+    } else {
+        asks_[o.price].push_back(node);
+        set_ask_active(o.price);
+        if (o.price < best_ask_) best_ask_ = o.price;
+        order_lookup_[o.order_id] = {node, o.price, true};
     }
 }
 
-void OrderBook::cancelOrder(int order_id)
-{
-    auto it = order_lookup.find(order_id);
-    if(it == order_lookup.end()) return;
+// ─────────────────────────────────────────────────────────────────────────────
+// cancelOrder — O(1): one array load + doubly-linked-list splice
+// ─────────────────────────────────────────────────────────────────────────────
 
-    auto order_it = it->second;
+HOT_FN void OrderBook::cancelOrder(int order_id) noexcept {
+    if (order_id <= 0 || order_id >= MAX_ORDERS) [[unlikely]] return;
 
-    // CRITICAL GUARD
-    if (order_it == std::deque<Order>::iterator{}) {
-        order_lookup.erase(it);
-        return;
+    OrderRef& ref = order_lookup_[order_id];
+    if (!ref.node) [[unlikely]] return;
+
+    OrderNode* node  = ref.node;
+    int        price = ref.price;
+
+    if (ref.is_ask) {
+        asks_[price].remove(node);
+        if (asks_[price].empty()) [[unlikely]] {
+            clr_ask_active(price);
+            if (price == best_ask_) scan_best_ask();
+        }
+    } else {
+        bids_[price].remove(node);
+        if (bids_[price].empty()) [[unlikely]] {
+            clr_bid_active(price);
+            if (price == best_bid_) scan_best_bid();
+        }
     }
 
-    int price = order_it->price;
-    Side side = order_it->side;
+    pool_free(node);
+    ref.node = nullptr;
+}
 
-    if(side == Side::BUY)
+// ─────────────────────────────────────────────────────────────────────────────
+// matchBuyOrder
+//
+// Hardware optimisations in this function:
+//   • FLATTEN_FN  — pop_front, pool_free, scan_best_ask all inlined here;
+//                   no call overhead, no register save/restore between them.
+//   • prefetch    — the order_lookup_ write slot is prefetched for store
+//                   while trade_qty arithmetic runs (hides ~40-cycle L3 miss).
+//   • [[likely]]  — the fast path (resting order partially filled, loop exits)
+//                   is marked likely so the CPU's branch predictor defaults to it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+HOT_FN FLATTEN_FN void OrderBook::matchBuyOrder(Order& order) noexcept {
+    while (order.quantity > 0
+           && best_ask_ < MAX_PRICE
+           && best_ask_ <= order.price)
     {
-        auto levelIt = bids.find(price);
-        if(levelIt != bids.end()){
-            auto &level = levelIt->second;
+        PriceLevel& level   = asks_[best_ask_];
+        OrderNode*  resting = level.head;
 
-            // VERIFY iterator still belongs
-            bool found = false;
-            for(auto itr = level.begin(); itr != level.end(); ++itr){
-                if(itr == order_it){
-                    level.erase(itr);
-                    found = true;
-                    break;
-                }
+        // Prefetch the order_lookup_ entry while we do the arithmetic below.
+        // By the time we need to nullify it, the cache line has arrived.
+        hw::prefetch</*write*/1, /*L1*/3>(&order_lookup_[resting->order_id]);
+
+        int trade_qty = std::min(order.quantity, resting->quantity);
+        order.quantity    -= trade_qty;
+        resting->quantity -= trade_qty;
+
+        if (resting->quantity == 0) [[unlikely]] {
+            order_lookup_[resting->order_id].node = nullptr;  // cache line already warm
+            level.pop_front();
+            pool_free(resting);
+
+            if (level.empty()) [[unlikely]] {
+                clr_ask_active(best_ask_);
+                scan_best_ask();
             }
-
-            if(!found){
-                order_lookup.erase(it);
-                return;
-            }
-
-            if(level.empty()) bids.erase(levelIt);
         }
+        // likely path: resting partially filled → order.quantity == 0 → loop exits
     }
-    else
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// matchSellOrder — mirror of matchBuyOrder
+// ─────────────────────────────────────────────────────────────────────────────
+
+HOT_FN FLATTEN_FN void OrderBook::matchSellOrder(Order& order) noexcept {
+    while (order.quantity > 0
+           && best_bid_ >= 0
+           && best_bid_ >= order.price)
     {
-        auto levelIt = asks.find(price);
-        if(levelIt != asks.end()){
-            auto &level = levelIt->second;
+        PriceLevel& level   = bids_[best_bid_];
+        OrderNode*  resting = level.head;
 
-            bool found = false;
-            for(auto itr = level.begin(); itr != level.end(); ++itr){
-                if(itr == order_it){
-                    level.erase(itr);
-                    found = true;
-                    break;
-                }
+        hw::prefetch<1, 3>(&order_lookup_[resting->order_id]);
+
+        int trade_qty = std::min(order.quantity, resting->quantity);
+        order.quantity    -= trade_qty;
+        resting->quantity -= trade_qty;
+
+        if (resting->quantity == 0) [[unlikely]] {
+            order_lookup_[resting->order_id].node = nullptr;
+            level.pop_front();
+            pool_free(resting);
+
+            if (level.empty()) [[unlikely]] {
+                clr_bid_active(best_bid_);
+                scan_best_bid();
             }
-
-            if(!found){
-                order_lookup.erase(it);
-                return;
-            }
-
-            if(level.empty()) asks.erase(levelIt);
-        }
-    }
-
-    order_lookup.erase(it);
-}
-
-int OrderBook::bestBid() const {
-
-    if(bids.empty()) {
-        return -1;
-    }
-
-    return bids.begin()->first;
-}
-
-int OrderBook::bestAsk() const
-{
-    if (asks.empty()){
-        return -1;
-    }
-
-    return asks.begin()->first;
-}
-
-// matching logic 
-
-void OrderBook::matchBuyOrder(Order &order)
-{
-    while(order.quantity > 0){
-        if(asks.empty()) break;
-
-        auto it = asks.begin();
-        int bestAsk = it->first;
-
-        if(bestAsk > order.price) break;
-
-        auto &level = it->second;
-        auto &restingOrder = level.front();
-
-        if (restingOrder.quantity == 0) {
-            order_lookup.erase(restingOrder.order_id);
-            level.pop_front();
-            continue;
-        }
-
-        int tradeQty = std::min(order.quantity, restingOrder.quantity);
-        order.quantity -= tradeQty;
-        restingOrder.quantity -= tradeQty;
-
-        if(restingOrder.quantity == 0){
-            order_lookup.erase(restingOrder.order_id);
-            level.pop_front();
-        }
-
-        if(level.empty()){
-            asks.erase(it);
         }
     }
 }
 
-void OrderBook::matchSellOrder(Order &order)
-{
-    while(order.quantity > 0 && !bids.empty()){
-        auto it = bids.begin();
-        int bestBid = it->first;
+// ─────────────────────────────────────────────────────────────────────────────
+// executeTrade — notification hook; not called internally by the hot path
+// ─────────────────────────────────────────────────────────────────────────────
 
-        if(bestBid < order.price) break;
-
-        auto &level = it->second;
-        auto &restingOrder = level.front();
-
-        if (restingOrder.quantity == 0) {
-            order_lookup.erase(restingOrder.order_id);
-            level.pop_front();
-            continue;
-        }
-
-        int tradeQty = std::min(order.quantity, restingOrder.quantity);
-        order.quantity -= tradeQty;
-        restingOrder.quantity -= tradeQty;
-
-        if(restingOrder.quantity == 0){
-            order_lookup.erase(restingOrder.order_id);
-            level.pop_front();
-        }
-
-        if(level.empty()){
-            bids.erase(it);
-        }
-    }
+void OrderBook::executeTrade(int price, int qty, int buyOrderId, int sellOrderId) {
+    std::cout << "TRADE"
+              << " price=" << price
+              << " qty="   << qty
+              << " buy="   << buyOrderId
+              << " sell="  << sellOrderId
+              << '\n';
 }
 
-void OrderBook::executeTrade(int price, int qty, int buyOrderId, int sellOrderId){
-    std::cout
-        << "TRADE "
-        << "price=" << price
-        << " qty=" << qty
-        << " buy=" << buyOrderId
-        << " sell=" << sellOrderId
-        << std::endl;
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// printOrderBook — debug snapshot (not on hot path)
+// ─────────────────────────────────────────────────────────────────────────────
 
-void OrderBook::printOrderBook() const{
-    std::cout<<"------------ORDER BOOK------------\n";
-    std::cout<<"ASKS\n";
-    for(const auto &[price, level]:asks){
-        std::cout<<price<<" : ";
-        for(const auto & order:level){
-            std::cout<<"[id="<<order.order_id<<" qty="<<order.quantity<<"] ";
-        }
-        std::cout<<"\n";
+void OrderBook::printOrderBook() const {
+    std::cout << "------------ORDER BOOK------------\n";
+    std::cout << "ASKS (lowest to highest):\n";
+    for (int p = 0; p < MAX_PRICE; ++p) {
+        if (asks_[p].empty()) continue;
+        std::cout << p << " : ";
+        for (OrderNode* n = asks_[p].head; n; n = n->next)
+            std::cout << "[id=" << n->order_id << " qty=" << n->quantity << "] ";
+        std::cout << '\n';
     }
-    std::cout<<"BIDS\n";
-    for(const auto & [price, level]:bids){
-        std::cout<<price<<" : ";
-        for(const auto & order:level){
-            std::cout<<"[id="<<order.order_id<<" qty="<<order.quantity<<"] ";
-        }
-        std::cout<<"\n";
+    std::cout << "BIDS (highest to lowest):\n";
+    for (int p = MAX_PRICE - 1; p >= 0; --p) {
+        if (bids_[p].empty()) continue;
+        std::cout << p << " : ";
+        for (OrderNode* n = bids_[p].head; n; n = n->next)
+            std::cout << "[id=" << n->order_id << " qty=" << n->quantity << "] ";
+        std::cout << '\n';
     }
     std::cout << "------------------------\n";
 }
 
-void OrderBook::processOrdersFromFile(const std::string& filename)
-{
-    std::ifstream file(filename);
-    std::string type;
+// ─────────────────────────────────────────────────────────────────────────────
+// processOrdersFromFile — file I/O wrapper; not on hot path
+// ─────────────────────────────────────────────────────────────────────────────
 
-    int next_id = 1;
+void OrderBook::processOrdersFromFile(const std::string& filename) {
+    std::ifstream file(filename);
+    std::string   type;
+    int next_id   = 1;
     int timestamp = 1;
 
-    while(file >> type)
-    {
-        if(type == "BUY")
-        {
+    while (file >> type) {
+        if (type == "BUY") {
             int price, qty;
             file >> price >> qty;
-
-            Order o(next_id++, Side::BUY, price, qty, timestamp++);
-            addOrder(o);
-        }
-        else if(type == "SELL")
-        {
+            addOrder(Order(next_id++, Side::BUY, price, qty, timestamp++));
+        } else if (type == "SELL") {
             int price, qty;
             file >> price >> qty;
-
-            Order o(next_id++, Side::SELL, price, qty, timestamp++);
-            addOrder(o);
-        }
-        else if(type == "CANCEL")
-        {
+            addOrder(Order(next_id++, Side::SELL, price, qty, timestamp++));
+        } else if (type == "CANCEL") {
             int id;
             file >> id;
-
             cancelOrder(id);
         }
-
-        // debug (keep for now)
-        // printOrderBook();
     }
 }
